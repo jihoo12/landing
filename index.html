@@ -467,11 +467,31 @@
   </footer>
 
   <script>
-    // ── WebGL Transparency / Glass Layers Shader ──
+    // ── WebGL Fluid — Mouse Reactive ──
     (function() {
       const canvas = document.getElementById('transparency-bg');
       const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
       if (!gl) return;
+
+      // ── Mouse tracking — smooth, persistent ──
+      const mouse = { x: 0.5, y: 0.5, tx: 0.5, ty: 0.5, active: 0.0 };
+      let lastMoveTime = 0;
+
+      function setMouse(nx, ny) {
+        mouse.tx = nx;
+        mouse.ty = ny;
+        mouse.active = 1.0;
+        lastMoveTime = performance.now();
+      }
+
+      // Track on window, not canvas — avoids leave gaps
+      window.addEventListener('mousemove', e => {
+        setMouse(e.clientX / window.innerWidth, 1.0 - e.clientY / window.innerHeight);
+      });
+      window.addEventListener('touchmove', e => {
+        const t = e.touches[0];
+        setMouse(t.clientX / window.innerWidth, 1.0 - t.clientY / window.innerHeight);
+      }, { passive: true });
 
       function resize() {
         const dpr = Math.min(window.devicePixelRatio, 2);
@@ -493,6 +513,8 @@
         precision highp float;
         uniform vec2  u_resolution;
         uniform float u_time;
+        uniform vec2  u_mouse;
+        uniform float u_mouseActive;
 
         vec3 permute(vec3 x) { return mod(((x * 34.0) + 1.0) * x, 289.0); }
 
@@ -539,62 +561,92 @@
           vec2 p = uv * vec2(aspect, 1.0);
           float t = u_time * 0.12;
 
-          // ── Layered transparent sheets ──
-          // Each layer: slow-drifting noise that shifts color
-          float L1 = fbm(p * 1.8 + vec2(t * 0.3,  t * 0.1));
-          float L2 = fbm(p * 2.2 + vec2(-t * 0.2,  t * 0.25) + L1 * 0.4);
-          float L3 = fbm(p * 1.5 + vec2(t * 0.15, -t * 0.18) + L2 * 0.3);
-          float L4 = fbm(p * 3.0 + vec2(-t * 0.1,  t * 0.12) + L3 * 0.2);
+          // Mouse in aspect-corrected space
+          vec2 mPos = u_mouse * vec2(aspect, 1.0);
+          float mDist = length(p - mPos);
 
-          // Normalize to 0..1
+          // ── Mouse influence — small, tight ──
+          float mRadius = 0.35;
+          float mInfluence = exp(-mDist * mDist / (mRadius * mRadius)) * u_mouseActive;
+
+          // Direction from cursor to pixel
+          vec2 mDir = (p - mPos) / max(mDist, 0.001);
+
+          // ── Ripple rings — tighter ──
+          float ripple = sin(mDist * 20.0 - u_time * 4.0) * 0.5 + 0.5;
+          ripple *= exp(-mDist * 5.0) * u_mouseActive;
+
+          // ── Distortion toward cursor ──
+          vec2 pullDir = -mDir;
+          vec2 distortion = pullDir * mInfluence * 0.25
+                          + mDir * ripple * 0.05;
+
+          // Swirl: tangential offset
+          vec2 tangent = vec2(-mDir.y, mDir.x);
+          distortion += tangent * mInfluence * 0.08;
+
+          vec2 dp = p + distortion;
+
+          // ── Mouse noise displacement ──
+          vec2 noiseOffset = mDir * mInfluence * 0.3;
+
+          // ── Layered transparent sheets ──
+          float L1 = fbm((dp + noiseOffset) * 1.8 + vec2(t * 0.3,  t * 0.1));
+          float L2 = fbm((dp - noiseOffset) * 2.2 + vec2(-t * 0.2,  t * 0.25) + L1 * 0.4);
+          float L3 = fbm(dp * 1.5 + vec2(t * 0.15, -t * 0.18) + L2 * 0.3 + noiseOffset * 0.3);
+          float L4 = fbm(dp * 3.0 + vec2(-t * 0.1,  t * 0.12) + L3 * 0.2);
+
           float n1 = L1 * 0.5 + 0.5;
           float n2 = L2 * 0.5 + 0.5;
           float n3 = L3 * 0.5 + 0.5;
           float n4 = L4 * 0.5 + 0.5;
 
-          // ── Transparency color palette ──
-          // Soft, desaturated hues with high lightness — like colored glass
-          vec3 tint1 = vec3(0.72, 0.78, 0.92);  // ice blue
-          vec3 tint2 = vec3(0.82, 0.75, 0.90);  // lavender
-          vec3 tint3 = vec3(0.75, 0.88, 0.85);  // mint
-          vec3 tint4 = vec3(0.90, 0.82, 0.78);  // peach
-          vec3 base  = vec3(0.96, 0.96, 0.98);  // near-white
+          // ── Color palette ──
+          vec3 tint1 = vec3(0.72, 0.78, 0.92);
+          vec3 tint2 = vec3(0.82, 0.75, 0.90);
+          vec3 tint3 = vec3(0.75, 0.88, 0.85);
+          vec3 tint4 = vec3(0.90, 0.82, 0.78);
+          vec3 base  = vec3(0.96, 0.96, 0.98);
 
-          // Each layer contributes with low alpha — like stacking colored glass
           vec3 col = base;
-
-          // Layer 1: large soft wash
           col = mix(col, tint1, (1.0 - n1) * 0.18);
-
-          // Layer 2: medium drift
           col = mix(col, tint2, (1.0 - n2) * 0.15);
-
-          // Layer 3: smaller detail
           col = mix(col, tint3, (1.0 - n3) * 0.12);
-
-          // Layer 4: fine grain shimmer
           col = mix(col, tint4, (1.0 - n4) * 0.08);
 
-          // ── Transparency edge highlights ──
-          // Where layers overlap, create brighter refraction lines
+          // ── Edge highlights ──
           float edge1 = pow(1.0 - abs(n1 - n2), 8.0);
           float edge2 = pow(1.0 - abs(n2 - n3), 8.0);
           float edge3 = pow(1.0 - abs(n3 - n4), 8.0);
-
           col += edge1 * vec3(0.3, 0.4, 0.6) * 0.15;
           col += edge2 * vec3(0.4, 0.3, 0.5) * 0.12;
           col += edge3 * vec3(0.3, 0.5, 0.4) * 0.10;
 
-          // ── Subtle glass caustics ──
-          float caustic = pow(abs(snoise(p * 6.0 + t * 0.5)), 10.0);
-          col += caustic * vec3(0.4, 0.5, 0.6) * 0.12;
+          // ── Mouse glow — tight, visible ──
+          float glow = exp(-mDist * mDist / 0.04) * u_mouseActive;
+          col += glow * vec3(0.3, 0.45, 0.65) * 0.5;
 
-          // ── Depth: slight warmth at top, cool at bottom ──
+          // ── Inner glow ring ──
+          float glowRing = exp(-pow(mDist - 0.12, 2.0) / 0.005) * u_mouseActive;
+          col += glowRing * vec3(0.4, 0.55, 0.7) * 0.25;
+
+          // ── Ripple brightness ──
+          col += ripple * vec3(0.3, 0.4, 0.55) * 0.12 * u_mouseActive;
+
+          // ── Caustics (enhanced near cursor) ──
+          float caustic = pow(abs(snoise(dp * 6.0 + t * 0.5)), 10.0);
+          float causticBoost = 1.0 + mInfluence * 2.0;
+          col += caustic * vec3(0.4, 0.5, 0.6) * 0.12 * causticBoost;
+
+          // ── Mouse proximity color shift ──
+          col = mix(col, vec3(0.78, 0.85, 0.95), mInfluence * 0.1);
+
+          // ── Depth gradient ──
           vec3 warmTop = mix(col, vec3(0.98, 0.95, 0.93), 0.06);
           vec3 coolBot = mix(col, vec3(0.92, 0.94, 0.98), 0.06);
           col = mix(coolBot, warmTop, uv.y);
 
-          // ── Minimal vignette ──
+          // ── Vignette ──
           float vig = 1.0 - 0.06 * length(uv - 0.5);
           col *= vig;
 
@@ -639,13 +691,27 @@
       gl.enableVertexAttribArray(aPos);
       gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
-      const uRes  = gl.getUniformLocation(prog, 'u_resolution');
-      const uTime = gl.getUniformLocation(prog, 'u_time');
+      const uRes   = gl.getUniformLocation(prog, 'u_resolution');
+      const uTime  = gl.getUniformLocation(prog, 'u_time');
+      const uMouse = gl.getUniformLocation(prog, 'u_mouse');
+      const uActive = gl.getUniformLocation(prog, 'u_mouseActive');
       const t0 = performance.now();
 
       function render() {
+        const now = performance.now();
+
+        // Smooth lerp — fast follow
+        mouse.x += (mouse.tx - mouse.x) * 0.1;
+        mouse.y += (mouse.ty - mouse.y) * 0.1;
+
+        // Slow fade: takes ~5s to fully decay after last move
+        const elapsed = (now - lastMoveTime) / 1000;
+        mouse.active = Math.max(0, 1.0 - elapsed * 0.2);
+
         gl.uniform2f(uRes, canvas.width, canvas.height);
-        gl.uniform1f(uTime, (performance.now() - t0) / 1000);
+        gl.uniform1f(uTime, (now - t0) / 1000);
+        gl.uniform2f(uMouse, mouse.x, mouse.y);
+        gl.uniform1f(uActive, mouse.active);
         gl.drawArrays(gl.TRIANGLES, 0, 6);
         requestAnimationFrame(render);
       }
